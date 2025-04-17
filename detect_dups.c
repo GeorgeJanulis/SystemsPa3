@@ -132,57 +132,50 @@ void print_duplicates()
         }
 
         int soft_link_group = 1;
+        int soft_link_total = 0;
         for (FileEntry *fe = entry->filepath; fe != NULL; fe = fe->next)
         {
-            //printf("hello!\n");
+            if (fe->is_symlink){
+                soft_link_total++;
+                //printf("Found symlink: %s (inode: %lu)\n", fe->filepath, fe->inode);
+            } 
+        }
 
-            //printf("hello!\n");
-            if (!fe->is_symlink) continue;
+        if (soft_link_total > 0)
+        {
+            //printf("hello");
+            ino_t symlink_inode = 0;
 
-            int already_printed = 0;
-
-            for (FileEntry *check = entry->filepath; check != fe; check = check->next)
+            for (FileEntry *fe = entry->filepath; fe != NULL; fe = fe->next)
             {
-                //printf("hello!\n");
-
-                if (check->is_symlink && fe->is_symlink && fe->filepath && strcmp(check->filepath, fe->filepath) == 0)
+                if (fe->is_symlink)
                 {
-                    already_printed = 1;
+                    symlink_inode = fe->inode;
                     break;
                 }
             }
-
-            if (already_printed) continue;
+            printf("\t\t\tSoft Link %d(%d): %lu\n", soft_link_group++, soft_link_total, symlink_inode); 
 
             int path_count = 0;
-            int count = 0;
 
-            for (FileEntry *inner = entry->filepath; inner != NULL; inner = inner->next)
+            for (FileEntry *fe = entry->filepath; fe != NULL; fe = fe->next)
             {
-                if ((inner->is_symlink))
+                if (!fe->is_symlink) continue;
+
+                if (path_count == 0)
                 {
-                    count++;
+                    printf("\t\t\tPaths:\t%s\n", fe->filepath);
                 }
+
+                else{
+                    printf("\t\t\t\t%s\n", fe->filepath);
+                }
+                path_count++;
             }
 
-            printf("\t\t\tSoft Link %d(%d): %lu\n", soft_link_group++, count, fe->inode);
-            for (FileEntry *inner = entry->filepath; inner != NULL; inner = inner->next)
-            {
-                if (inner->is_symlink){
-                    if (path_count == 0)
-                    {
-                        printf("\t\t\t\tPaths:\t%s\n", inner->filepath);
-                    }
-                    else
-                    {
-                        printf("\t\t\t\t\t%s\n", inner->filepath);
-                    }
-                    path_count++;
-                }
-            }
-
-            printed_symlinks++;
+                    
         }
+        
     }
 
 
@@ -232,6 +225,38 @@ int is_duplicate(const char *md5, const char *filepath, const struct stat *sb)
     return 0;
 }
 
+void insert_symlink(const char *symlink_path, ino_t target_inode, dev_t target_dev)
+{
+    struct stat target_stat;
+    struct stat symlink_stat;
+    char real_path[PATH_MAX];
+
+    if (lstat(symlink_path, &symlink_stat) != 0 || !S_ISLNK(symlink_stat.st_mode))
+    {
+        return;
+    }
+    if (realpath(symlink_path, real_path) == NULL)
+    {
+        return;
+    }
+
+    if (stat(real_path, &target_stat) != 0 || !S_ISREG(target_stat.st_mode))
+    {
+        return;
+    }
+
+    char md5[33];
+
+    compute_md5(real_path, md5);
+
+    if (md5[0] == '\0')
+    {
+        return;
+    }
+
+    is_duplicate(md5, symlink_path, &symlink_stat);
+}
+
 // render the file information invoked by nftw
 static int render_file_info(const char *fpath, const struct stat *sb, int tflag, struct FTW *ftwbuf) {
     // perform the inode operations over here
@@ -248,52 +273,36 @@ static int render_file_info(const char *fpath, const struct stat *sb, int tflag,
     }
 
     else if (tflag == FTW_SL) {
-        char real_target[PATH_MAX];
-        char real_target[PATH_MAX];
+        struct stat target;
+        char resolved_path[PATH_MAX];
 
-       
-        ssize_t len = readlink(fpath, real_target, sizeof(real_target) - 1);
-        if (len != -1) {
-            real_target[len] = '\0';  // Null-terminate the real target path
-
-            
-        if (realpath(real_target, resolved_target) != NULL) {
-            struct stat target_stat;
-
-
-            if (stat(resolved_target, &target_stat) == 0 && S_ISREG(target_stat.st_mode)) {
-                char md5[33];
-                compute_md5(resolved_target, md5);
-
-                if (md5[0] != '\0') {
-                    is_duplicate(md5, fpath, &target_stat); 
-                }
+        if (realpath(fpath, resolved_path) == NULL)
+        {
+            perror("realpath failed for symlink");
+            printf("Symlink path: %s\n", fpath);
+        }
+        else
+        {
+            if (stat(resolved_path, &target) == 0 && S_ISREG(target.st_mode))
+            {
+                insert_symlink(fpath, target.st_ino, target.st_dev);
+            }
+            else
+            {
+                printf("Symlink does not point to a regular file: %s (mode: %o)\n", resolved_path, target.st_mode);
             }
         }
 
-        /*struct stat newSb;
-        struct stat target;
-
-        char symPath[PATH_MAX];
-        ssize_t len = readlink(fpath, symPath, sizeof(symPath - 1));
-
-        if (realpath(fpath, symPath) != NULL)
-        {
-
-            if (stat(symPath, &target) == 0 && S_ISREG(target.st_mode))
-            {
-
-                    char md5[33];
-                    compute_md5(symPath, md5);
-
-                    if (md5[0] != '\0')
-                    {
-                        is_duplicate(md5, fpath, &target);
-                    }
-                
-            }
+        /*if (stat(fpath, &target) != 0) {
+            perror("stat failed for symlink");
+            printf("Symlink path: %s\n", fpath);
+        } else if (S_ISREG(target.st_mode)) {
+            printf("Symlink points to regular file: %s\n", fpath);
+            insert_symlink(fpath, target.st_ino, target.st_dev);
+        } else {
+            printf("Symlink points to something else: %s (mode: %o)\n", fpath, target.st_mode);
         }*/
-
+    }
     
 
     return 0;
