@@ -248,24 +248,28 @@ static int render_file_info(const char *fpath, const struct stat *sb, int tflag,
     }
 
     else if (tflag == FTW_SL) {
-        struct stat target;
+        char real_target[PATH_MAX];
         char real_target[PATH_MAX];
 
-        // Resolve symlink path
+       
         ssize_t len = readlink(fpath, real_target, sizeof(real_target) - 1);
         if (len != -1) {
             real_target[len] = '\0';  // Null-terminate the real target path
 
-            // Compute MD5 hash of the symlink target
-            char md5[33];
-            compute_md5(real_target, md5);
+            
+        if (realpath(real_target, resolved_target) != NULL) {
+            struct stat target_stat;
 
-            if (md5[0] != '\0') {
-                is_duplicate(md5, fpath, &target);  // Call is_duplicate for symlinks
+
+            if (stat(resolved_target, &target_stat) == 0 && S_ISREG(target_stat.st_mode)) {
+                char md5[33];
+                compute_md5(resolved_target, md5);
+
+                if (md5[0] != '\0') {
+                    is_duplicate(md5, fpath, &target_stat); 
+                }
             }
         }
-    }
-
 
         /*struct stat newSb;
         struct stat target;
