@@ -7,27 +7,26 @@
 
 
 // define any other global variable you may need over here
+typedef struct path_node {
+    char *path;
+    struct path_node *next;
+} path_node;
 
-typedef struct FileEntry {
-    char *filepath;
-    ino_t inode;
-    dev_t dev;
-    mode_t mode;
-    nlink_t nlink;
-    int is_symlink;
-    struct FileEntry *next;
-}FileEntry;
-
-typedef struct{
+typedef struct file_entry {
     char md5[33];
-    FileEntry *filepath;
+    ino_t inode;
+    int hardlink_count;
+    path_node *paths;      // hard link paths
+    path_node *symlinks;   // symlink paths
     UT_hash_handle hh;
-} FileHash;
+} file_entry;
+
+file_entry *file_map = NULL;
 // open ssl, this will be used to get the hash of the file
 EVP_MD_CTX *mdctx;
 const EVP_MD *EVP_md5(); // use md5 hash!!
 
-FileHash *file_hashes = NULL;
+//FileHash *file_hashes = NULL;
 
 void compute_md5(const char *filename, char *output)
 {
@@ -66,119 +65,33 @@ void compute_md5(const char *filename, char *output)
     output[32] = '\0';
 
 }
-void print_duplicates()
-{
-    FileHash *entry, *tmp;
-    int file_index = 1;
+void print_dedup_report() {
+    file_entry *entry, *tmp;
+    int file_number = 1;
 
-    HASH_ITER(hh, file_hashes, entry, tmp){
-        int count = 0;
-
-        for (FileEntry *fe = entry->filepath; fe != NULL; fe = fe->next)
-        {
-            count++;
-        }
-
-        if (count <= 1)
-        {
-            continue;
-        }
-
-        printf("File %d\n", file_index++);
+    HASH_ITER(hh, file_map, entry, tmp) {
+        printf("File %d:\n", file_number++);
         printf("\tMD5 Hash: %s\n", entry->md5);
+        printf("\t\tHard Link (%d): %lu\n", entry->hardlink_count, entry->inode);
 
-        int printed_hard_links = 0;
-        int printed_symlinks = 0;
-
-        for (FileEntry *fe = entry->filepath; fe != NULL; fe = fe->next)
-        {
-            if ((!S_ISREG(fe->mode)) || (fe->is_symlink)) continue;
-
-            int already_printed = 0;
-
-            for (FileEntry *check = entry->filepath; check != fe; check = check->next)
-            {
-                if (fe->inode == check->inode && fe->dev == check->dev)
-                {
-                    already_printed = 1;
-                    break;
-                }
-            }
-
-            if (already_printed) continue;
-
-            int path_count = 0;
-
-            printf("\tHard Link (%ld): %lu\n", fe->nlink, fe->inode);
-
-            for (FileEntry *inner = entry->filepath; inner != NULL; inner = inner->next)
-            {
-                if (S_ISREG(inner->mode) && !inner->is_symlink && inner->inode == fe->inode && inner->dev == fe->dev)
-                {
-                    if (path_count == 0)
-                    {
-                        printf("\t\t\tPaths:\t%s\n", inner->filepath);
-                    }
-
-                    else
-                    {
-                        printf("\t\t\t\t%s\n", inner->filepath);
-                    }
-                    path_count++;
-                }
-
-            }
-            printed_hard_links++;
+        path_node *p = entry->paths;
+        while (p) {
+            printf("\t\t\tPaths:\t%s\n", p->path);
+            p = p->next;
         }
 
-        int soft_link_group = 1;
-        int soft_link_total = 0;
-        for (FileEntry *fe = entry->filepath; fe != NULL; fe = fe->next)
-        {
-            if (fe->is_symlink){
-                soft_link_total++;
-                //printf("Found symlink: %s (inode: %lu)\n", fe->filepath, fe->inode);
-            } 
-        }
-
-        if (soft_link_total > 0)
-        {
-            //printf("hello");
-            ino_t symlink_inode = 0;
-
-            for (FileEntry *fe = entry->filepath; fe != NULL; fe = fe->next)
-            {
-                if (fe->is_symlink)
-                {
-                    symlink_inode = fe->inode;
-                    break;
-                }
+        // Print symlinks if any
+        int symlink_count = 0;
+        path_node *s = entry->symlinks;
+        while (s) {
+            if (symlink_count == 0) {
+                printf("\t\t\tSoft Link 1: %lu\n", entry->inode);
             }
-            printf("\t\t\tSoft Link %d(%d): %lu\n", soft_link_group++, soft_link_total, symlink_inode); 
-
-            int path_count = 0;
-
-            for (FileEntry *fe = entry->filepath; fe != NULL; fe = fe->next)
-            {
-                if (!fe->is_symlink) continue;
-
-                if (path_count == 0)
-                {
-                    printf("\t\t\tPaths:\t%s\n", fe->filepath);
-                }
-
-                else{
-                    printf("\t\t\t\t%s\n", fe->filepath);
-                }
-                path_count++;
-            }
-
-                    
+            printf("\t\t\t\tPaths:\t%s\n", s->path);
+            s = s->next;
+            symlink_count++;
         }
-        
     }
-
-
 }
 
 
@@ -187,7 +100,7 @@ int main(int argc, char *argv[]) {
 
     int r = nftw(argv[1], render_file_info, 10, FTW_PHYS);
 
-    print_duplicates();
+    print_dedup_report();
 
     //print_md5(file_hash->md5);
     //printf("hello");
@@ -197,64 +110,63 @@ int main(int argc, char *argv[]) {
     // add the nftw handler to explore the directory
     // nftw should invoke the render_file_info function
 }
-int is_duplicate(const char *md5, const char *filepath, const struct stat *sb)
+void is_duplicate(const char *md5, const char *path, const struct stat *sb)
 {
-    FileHash *entry = NULL;
-    HASH_FIND_STR(file_hashes, md5, entry);
+    file_entry *entry = NULL;
 
-    if (!entry){
-        entry = malloc(sizeof(FileHash));
-        strncpy(entry->md5, md5, 33);
-        entry->filepath = NULL;
-        HASH_ADD_STR(file_hashes, md5, entry);
-        //printf("not duplicate, has been added!\n");
+    // Check if we've seen this hash before
+    HASH_FIND_STR(file_map, md5, entry);
+
+    if (!entry) {
+        // First time seeing this hash: create a new entry
+        entry = malloc(sizeof(file_entry));
+        if (!entry) {
+            perror("malloc");
+            return;
+        }
+
+        strncpy(entry->md5, md5, sizeof(entry->md5));
+        entry->inode = sb->st_ino;
+        entry->hardlink_count = 1;
+        entry->paths = NULL;
+        entry->symlinks = NULL;
+
+        path_node *node = malloc(sizeof(path_node));
+        node->path = strdup(path);
+        node->next = NULL;
+        entry->paths = node;
+
+        HASH_ADD_STR(file_map, md5, entry);
+    } else {
+        // Same hash seen before
+        if (entry->inode == sb->st_ino) {
+            // Same inode = hard link
+            entry->hardlink_count++;
+
+            // Add to paths list
+            path_node *node = malloc(sizeof(path_node));
+            node->path = strdup(path);
+            node->next = entry->paths;
+            entry->paths = node;
+        } else {
+            // Different inode but same content = soft duplicate (not a hard link)
+            // We assume one inode per md5, so you can adapt this if needed
+            // For now, treat it like a new hard link group under same MD5
+
+            // Could track multiple inodes under one hash if needed
+            fprintf(stderr, "Warning: same MD5 but different inode for: %s\n", path);
+        }
     }
-
-    FileEntry *new_file = malloc(sizeof(FileEntry));
-    new_file->filepath = strdup(filepath);
-    new_file->inode = sb->st_ino;
-    new_file->dev = sb->st_dev;
-    new_file->mode = sb->st_mode;
-    new_file->nlink = sb->st_nlink;
-    new_file->next = entry->filepath;
-    new_file->is_symlink = S_ISLNK(sb->st_mode);
-    entry->filepath = new_file;
-
-    //printf("%d\n", new_file->is_symlink);
-
-    return 0;
 }
-
-void insert_symlink(const char *symlink_path, ino_t target_inode, dev_t target_dev)
-{
-    struct stat target_stat;
-    struct stat symlink_stat;
-    char real_path[PATH_MAX];
-
-    if (lstat(symlink_path, &symlink_stat) != 0 || !S_ISLNK(symlink_stat.st_mode))
-    {
-        return;
+void add_symlink(const char *md5, const char *symlink_path) {
+    file_entry *entry;
+    HASH_FIND_STR(file_map, md5, entry);
+    if (entry) {
+        path_node *new_symlink = malloc(sizeof(path_node));
+        new_symlink->path = strdup(symlink_path);
+        new_symlink->next = entry->symlinks;
+        entry->symlinks = new_symlink;
     }
-    if (realpath(symlink_path, real_path) == NULL)
-    {
-        return;
-    }
-
-    if (stat(real_path, &target_stat) != 0 || !S_ISREG(target_stat.st_mode))
-    {
-        return;
-    }
-
-    char md5[33];
-
-    compute_md5(real_path, md5);
-
-    if (md5[0] == '\0')
-    {
-        return;
-    }
-
-    is_duplicate(md5, symlink_path, &symlink_stat);
 }
 
 // render the file information invoked by nftw
@@ -275,23 +187,13 @@ static int render_file_info(const char *fpath, const struct stat *sb, int tflag,
     else if (tflag == FTW_SL) {
         struct stat target;
         char resolved_path[PATH_MAX];
+        char md5[33];
+        compute_md5(fpath, md5);
+        printf("%s\n", md5);
 
-        if (realpath(fpath, resolved_path) == NULL)
-        {
-            perror("realpath failed for symlink");
-            printf("Symlink path: %s\n", fpath);
-        }
-        else
-        {
-            if (stat(resolved_path, &target) == 0 && S_ISREG(target.st_mode))
-            {
-                insert_symlink(fpath, target.st_ino, target.st_dev);
-            }
-            else
-            {
-                printf("Symlink does not point to a regular file: %s (mode: %o)\n", resolved_path, target.st_mode);
-            }
-        }
+        //printf("hello");
+        add_symlink(md5, fpath);
+        
 
         /*if (stat(fpath, &target) != 0) {
             perror("stat failed for symlink");
@@ -309,7 +211,3 @@ static int render_file_info(const char *fpath, const struct stat *sb, int tflag,
 
     // invoke any function that you may need to render the file information
 }
-
-
-
-// add any other functions you may need over here
