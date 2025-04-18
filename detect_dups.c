@@ -11,12 +11,14 @@
 typedef struct path_node {
     char *path;
     struct path_node *next;
+    ino_t inode;
 } path_node;
 
 typedef struct inode_group {
     ino_t inode;
     int count;
     path_node *paths;
+    path_node *symlinks;
     struct inode_group *next;
 } inode_group;
 
@@ -78,36 +80,46 @@ void print_dedup_report() {
     int file_number = 1;
 
     HASH_ITER(hh, file_map, entry, tmp) {
-        printf("File %d:\n", file_number++);
+        printf("File %d\n", file_number++);
         printf("\tMD5 Hash: %s\n", entry->md5);
 
         inode_group *group = entry->inodes;
         int hardlink_set_number = 1;
+
         while (group) {
-            printf("\t\tHard Link (%d): %lu\n", group->count, group->inode);
+            int softcount = 1;
+            printf("\tHard Link (%d): %lu\n", group->count, group->inode);
             path_node *p = group->paths;
+            int tf = 0;
             while (p) {
-                printf("\t\t\tPaths:\t%s\n", p->path);
+                printf(tf == 0 ? "\t\tPaths:\t%s\n" : "\t\t\t%s\n", p->path);
+                tf = 1;
                 p = p->next;
             }
+
+            if (group->symlinks) {
+                int count = 0;
+                path_node *temp = group->symlinks;
+                while (temp) {
+                    count++;
+                    temp = temp->next;
+                }
+
+                printf("\t\tSoft Link %d(%d): %lu\n", softcount++, count, group->symlinks->inode);
+                temp = group->symlinks;
+                tf = 0;
+                while (temp) {
+                    printf(tf == 0 ? "\t\t\tPaths:\t%s\n" : "\t\t\t%s\n", temp->path);
+                    tf = 1;
+                    temp = temp->next;
+                }
+            }
+
             group = group->next;
             hardlink_set_number++;
         }
-
-        // Print symlinks if any
-        int symlink_count = 0;
-        path_node *s = entry->symlinks;
-        if (s) {
-            printf("\t\t\tSoft Link 1 (%d):\n", symlink_count);
-        }
-        while (s) {
-            printf("\t\t\t\tPaths:\t%s\n", s->path);
-            s = s->next;
-            symlink_count++;
-        }
     }
 }
-
 
 int main(int argc, char *argv[]) {
     // perform error handling, "exit" with failure incase an error occurs
@@ -177,13 +189,33 @@ void is_duplicate(const char *md5, const char *path, const struct stat *sb)
     }
 }
 void add_symlink(const char *md5, const char *symlink_path) {
+    struct stat sb;
+    struct stat sb2;
+    //printf("hello\n");
+    if (lstat(symlink_path, &sb) != 0 || stat(symlink_path, &sb2) != 0)
+    {
+        perror("stat (symlink)");
+        return;
+    }
+
+    //printf("hello2\n");
     file_entry *entry;
     HASH_FIND_STR(file_map, md5, entry);
-    if (entry) {
-        path_node *new_symlink = malloc(sizeof(path_node));
-        new_symlink->path = strdup(symlink_path);
-        new_symlink->next = entry->symlinks;
-        entry->symlinks = new_symlink;
+    if (!entry) return;
+
+    inode_group *group = entry->inodes;
+    while (group) {
+        if (group->inode == sb2.st_ino)
+        {
+            path_node *new_symlink = malloc(sizeof(path_node));
+            new_symlink->path = strdup(symlink_path);
+            new_symlink->next = group->symlinks;
+            new_symlink->inode = sb.st_ino;
+            group->symlinks = new_symlink;
+            return;
+        }
+
+        group = group->next;
     }
 }
 
@@ -207,12 +239,12 @@ static int render_file_info(const char *fpath, const struct stat *sb, int tflag,
 
 
     // Debugging: Print the symlink target
-        printf("Symlink target: %s\n", fpath);
+        //printf("Symlink target: %s\n", fpath);
         char target[PATH_MAX];
         ssize_t len = readlink(fpath, target, sizeof(target) - 1);
         if (len != -1) {
             target[len] = '\0';  // Null-terminate it
-            printf("Symlink points to: %s\n", target);
+            //printf("Symlink points to: %s\n", target);
         } else {
             perror("readlink");
         }
@@ -227,7 +259,7 @@ static int render_file_info(const char *fpath, const struct stat *sb, int tflag,
 
         //printf("%s\n", resolved_path);
         if (md5[0] != '\0') {
-            add_symlink(md5, resolved_path);
+            add_symlink(md5, fpath);
         }
     }
     
@@ -237,3 +269,4 @@ static int render_file_info(const char *fpath, const struct stat *sb, int tflag,
 
     // invoke any function that you may need to render the file information
 }
+
