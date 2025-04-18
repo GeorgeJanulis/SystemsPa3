@@ -4,6 +4,7 @@
 #include "uthash.h"
 #include <ftw.h>
 #include <unistd.h>  // For readlink and realpath
+#include <libgen.h>
 
 
 // define any other global variable you may need over here
@@ -12,12 +13,17 @@ typedef struct path_node {
     struct path_node *next;
 } path_node;
 
+typedef struct inode_group {
+    ino_t inode;
+    int count;
+    path_node *paths;
+    struct inode_group *next;
+} inode_group;
+
 typedef struct file_entry {
     char md5[33];
-    ino_t inode;
-    int hardlink_count;
-    path_node *paths;      // hard link paths
-    path_node *symlinks;   // symlink paths
+    inode_group *inodes;
+    path_node *symlinks;
     UT_hash_handle hh;
 } file_entry;
 
@@ -39,6 +45,7 @@ void compute_md5(const char *filename, char *output)
 
     if (!file)
     {
+        //printf("symlink?\n");
         output[0] = '0';
         //perror("malloc");
         return;
@@ -65,6 +72,7 @@ void compute_md5(const char *filename, char *output)
     output[32] = '\0';
 
 }
+
 void print_dedup_report() {
     file_entry *entry, *tmp;
     int file_number = 1;
@@ -72,21 +80,27 @@ void print_dedup_report() {
     HASH_ITER(hh, file_map, entry, tmp) {
         printf("File %d:\n", file_number++);
         printf("\tMD5 Hash: %s\n", entry->md5);
-        printf("\t\tHard Link (%d): %lu\n", entry->hardlink_count, entry->inode);
 
-        path_node *p = entry->paths;
-        while (p) {
-            printf("\t\t\tPaths:\t%s\n", p->path);
-            p = p->next;
+        inode_group *group = entry->inodes;
+        int hardlink_set_number = 1;
+        while (group) {
+            printf("\t\tHard Link (%d): %lu\n", group->count, group->inode);
+            path_node *p = group->paths;
+            while (p) {
+                printf("\t\t\tPaths:\t%s\n", p->path);
+                p = p->next;
+            }
+            group = group->next;
+            hardlink_set_number++;
         }
 
         // Print symlinks if any
         int symlink_count = 0;
         path_node *s = entry->symlinks;
+        if (s) {
+            printf("\t\t\tSoft Link 1 (%d):\n", symlink_count);
+        }
         while (s) {
-            if (symlink_count == 0) {
-                printf("\t\t\tSoft Link 1: %lu\n", entry->inode);
-            }
             printf("\t\t\t\tPaths:\t%s\n", s->path);
             s = s->next;
             symlink_count++;
@@ -97,7 +111,7 @@ void print_dedup_report() {
 
 int main(int argc, char *argv[]) {
     // perform error handling, "exit" with failure incase an error occurs
-
+    //printf("%s\n", argv[1]);
     int r = nftw(argv[1], render_file_info, 10, FTW_PHYS);
 
     print_dedup_report();
@@ -113,49 +127,53 @@ int main(int argc, char *argv[]) {
 void is_duplicate(const char *md5, const char *path, const struct stat *sb)
 {
     file_entry *entry = NULL;
-
-    // Check if we've seen this hash before
     HASH_FIND_STR(file_map, md5, entry);
 
     if (!entry) {
-        // First time seeing this hash: create a new entry
-        entry = malloc(sizeof(file_entry));
-        if (!entry) {
-            perror("malloc");
-            return;
-        }
-
+        // New MD5
+        entry = calloc(1, sizeof(file_entry));
         strncpy(entry->md5, md5, sizeof(entry->md5));
-        entry->inode = sb->st_ino;
-        entry->hardlink_count = 1;
-        entry->paths = NULL;
-        entry->symlinks = NULL;
+
+        inode_group *group = calloc(1, sizeof(inode_group));
+        group->inode = sb->st_ino;
+        group->count = 1;
+        group->paths = NULL;
 
         path_node *node = malloc(sizeof(path_node));
         node->path = strdup(path);
         node->next = NULL;
-        entry->paths = node;
+        group->paths = node;
+
+        entry->inodes = group;
 
         HASH_ADD_STR(file_map, md5, entry);
     } else {
-        // Same hash seen before
-        if (entry->inode == sb->st_ino) {
-            // Same inode = hard link
-            entry->hardlink_count++;
-
-            // Add to paths list
-            path_node *node = malloc(sizeof(path_node));
-            node->path = strdup(path);
-            node->next = entry->paths;
-            entry->paths = node;
-        } else {
-            // Different inode but same content = soft duplicate (not a hard link)
-            // We assume one inode per md5, so you can adapt this if needed
-            // For now, treat it like a new hard link group under same MD5
-
-            // Could track multiple inodes under one hash if needed
-            fprintf(stderr, "Warning: same MD5 but different inode for: %s\n", path);
+        inode_group *group = entry->inodes;
+        while (group) {
+            if (group->inode == sb->st_ino) {
+                // Existing hard link group
+                group->count++;
+                path_node *node = malloc(sizeof(path_node));
+                node->path = strdup(path);
+                node->next = group->paths;
+                group->paths = node;
+                return;
+            }
+            group = group->next;
         }
+
+        // New hardlink group with same content (different inode)
+        inode_group *new_group = calloc(1, sizeof(inode_group));
+        new_group->inode = sb->st_ino;
+        new_group->count = 1;
+
+        path_node *node = malloc(sizeof(path_node));
+        node->path = strdup(path);
+        node->next = NULL;
+        new_group->paths = node;
+
+        new_group->next = entry->inodes;
+        entry->inodes = new_group;
     }
 }
 void add_symlink(const char *md5, const char *symlink_path) {
@@ -172,6 +190,7 @@ void add_symlink(const char *md5, const char *symlink_path) {
 // render the file information invoked by nftw
 static int render_file_info(const char *fpath, const struct stat *sb, int tflag, struct FTW *ftwbuf) {
     // perform the inode operations over here
+    //printf("%s\n", fpath);
 
     if (tflag == FTW_F)
     {
@@ -185,26 +204,33 @@ static int render_file_info(const char *fpath, const struct stat *sb, int tflag,
     }
 
     else if (tflag == FTW_SL) {
-        struct stat target;
-        char resolved_path[PATH_MAX];
-        char md5[33];
-        compute_md5(fpath, md5);
-        printf("%s\n", md5);
 
-        //printf("hello");
-        add_symlink(md5, fpath);
-        
 
-        /*if (stat(fpath, &target) != 0) {
-            perror("stat failed for symlink");
-            printf("Symlink path: %s\n", fpath);
-        } else if (S_ISREG(target.st_mode)) {
-            printf("Symlink points to regular file: %s\n", fpath);
-            insert_symlink(fpath, target.st_ino, target.st_dev);
+    // Debugging: Print the symlink target
+        printf("Symlink target: %s\n", fpath);
+        char target[PATH_MAX];
+        ssize_t len = readlink(fpath, target, sizeof(target) - 1);
+        if (len != -1) {
+            target[len] = '\0';  // Null-terminate it
+            printf("Symlink points to: %s\n", target);
         } else {
-            printf("Symlink points to something else: %s (mode: %o)\n", fpath, target.st_mode);
-        }*/
+            perror("readlink");
+        }
+        // Optionally resolve full path
+        char resolved_path[PATH_MAX];
+        realpath(fpath, resolved_path);
+        /*ssize_t len = readlink(fpath, resolved_path, sizeof(resolved_path) - 1);
+        resolved_path[len] = '\0';*/
+        //printf("hello\n");
+        char md5[33];
+        compute_md5(resolved_path, md5);
+
+        //printf("%s\n", resolved_path);
+        if (md5[0] != '\0') {
+            add_symlink(md5, resolved_path);
+        }
     }
+    
     
 
     return 0;
